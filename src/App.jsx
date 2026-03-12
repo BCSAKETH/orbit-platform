@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { isConfigured } from "./supabase.js";
+import * as DB from "./db.js";
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   ResponsiveContainer, Tooltip, BarChart, Bar, XAxis, YAxis, Cell,
@@ -461,16 +463,62 @@ export default function OrbitApp(){
   const[regForm,setRegForm]=useState({name:"",roll:"",dept:"CSE",section:"A",cgpa:"",leetcode:"",github:"",codeforces:"",codechef:""});
   const[showReg,setShowReg]=useState(false);
   const[verifyCode]=useState("ORBIT-"+Math.random().toString(36).substring(2,8).toUpperCase());
-  /* Incharge DM compose modal */
   const[dmModal,setDmModal]=useState({open:false,student:null,msg:""});
   const[interviewRequests,setInterviewRequests]=useState([]);
   const[geminiKey,setGeminiKey]=useState(()=>localStorage.getItem("orbit_gemini_key")||"");
   const[showKeyModal,setShowKeyModal]=useState(()=>!localStorage.getItem("orbit_gemini_key"));
+  const[dbLoading,setDbLoading]=useState(isConfigured);
+  const realtimeRefs=useRef([]);
 
+  /* ── Gemini key sync ── */
   useEffect(()=>{
     window.__GEMINI_KEY=geminiKey;
     if(geminiKey)localStorage.setItem("orbit_gemini_key",geminiKey);
   },[geminiKey]);
+
+  /* ── Supabase: bootstrap data on mount (when configured) ── */
+  useEffect(()=>{
+    if(!isConfigured){setDbLoading(false);return;}
+    (async()=>{
+      try{
+        const studs=await DB.fetchAllStudents();
+        if(studs)setStudents(studs);
+        const msgs=await DB.fetchCommunityMessages();
+        if(msgs&&msgs.length)setCommunityMsgs(msgs);
+      }catch(e){console.warn("[ORBIT] bootstrap error:",e.message);}
+      finally{setDbLoading(false);}
+    })();
+  },[]);
+
+  /* ── Supabase: realtime community messages ── */
+  useEffect(()=>{
+    if(!isConfigured)return;
+    const ch=DB.subscribeToCommunity(msg=>setCommunityMsgs(p=>[...p,msg]));
+    realtimeRefs.current.push(ch);
+    return()=>realtimeRefs.current.forEach(DB.unsubscribe);
+  },[]);
+
+  /* ── Supabase: realtime DMs when logged in as student ── */
+  useEffect(()=>{
+    if(!isConfigured||!activeStudent)return;
+    const ch=DB.subscribeToDms(activeStudent.id,dm=>setDms(p=>[...p,dm]));
+    realtimeRefs.current.push(ch);
+    return()=>DB.unsubscribe(ch);
+  },[activeStudent]);
+
+  /* ── Supabase: load DMs + interview requests after student login ── */
+  useEffect(()=>{
+    if(!isConfigured||!role)return;
+    (async()=>{
+      if(role==="student"&&activeStudent){
+        try{const d=await DB.fetchStudentDms(activeStudent.id);setDms(d);}catch(e){}
+        try{const r=await DB.fetchInterviewRequests();setInterviewRequests(r.filter(x=>x.studentId===activeStudent.id));}catch(e){}
+      }
+      if(role==="incharge"&&currentUser){
+        try{const r=await DB.fetchInterviewRequests(currentUser.dept,currentUser.section);setInterviewRequests(r);}catch(e){}
+      }
+    })();
+  },[role,activeStudent,currentUser]);
 
   useEffect(()=>{
     const style=document.createElement("style");
@@ -481,42 +529,67 @@ export default function OrbitApp(){
 
   const showNotif=(msg,type="info")=>{setNotif({msg,type});setTimeout(()=>setNotif(null),3200);};
 
-  const handleApprove=(id)=>{setStudents(p=>p.map(s=>s.id===id?{...s,status:"ACTIVE"}:s));showNotif("✅ Student activated","success");};
-  const handleReject=(id)=>{setStudents(p=>p.filter(s=>s.id!==id));showNotif("❌ Registration rejected","error");};
-  const handleRegSubmit=()=>{
+  const handleApprove=async(id)=>{
+    setStudents(p=>p.map(s=>s.id===id?{...s,status:"ACTIVE"}:s));
+    showNotif("✅ Student activated","success");
+    if(isConfigured){try{await DB.approveStudent(id);}catch(e){showNotif("DB error: "+e.message,"error");}}
+  };
+  const handleReject=async(id)=>{
+    setStudents(p=>p.filter(s=>s.id!==id));
+    showNotif("❌ Registration rejected","error");
+    if(isConfigured){try{await DB.rejectStudent(id);}catch(e){}}
+  };
+  const handleRegSubmit=async()=>{
     if(!regForm.name||!regForm.roll)return showNotif("Fill required fields","error");
     const newS={...genStudent(students.length),name:regForm.name,roll:regForm.roll,dept:regForm.dept,section:regForm.section,cgpa:parseFloat(regForm.cgpa)||7.0,status:"PENDING"};
     setStudents(p=>[...p,newS]);setShowReg(false);
     showNotif("✅ Registration submitted — pending approval","success");
+    if(isConfigured){
+      try{await DB.registerStudent(regForm);}
+      catch(e){showNotif("Registration error: "+e.message,"error");}
+    }
   };
-  const handleLogin=(loginType,identifier,password)=>{
-    const result=authenticate(loginType,identifier,password,students);
-    if(!result){showNotif("❌ Invalid credentials","error");return;}
-    setRole(result.role);setCurrentUser(result.user);
-    if(result.role==="student")setActiveStudent(result.user);
-    setView("dashboard");
+  const handleLogin=async(loginType,identifier,password)=>{
+    /* Always try local mock auth first (works in demo mode) */
+    const localResult=authenticate(loginType,identifier,password,students);
+    if(localResult){
+      setRole(localResult.role);setCurrentUser(localResult.user);
+      if(localResult.role==="student")setActiveStudent(localResult.user);
+      setView("dashboard");return;
+    }
+    /* If Supabase configured, try real auth */
+    if(isConfigured){
+      try{
+        let result;
+        if(loginType==="student") result=await DB.loginStudent(identifier,password);
+        else result=await DB.loginStaff(identifier,password);
+        setRole(result.role);setCurrentUser(result.user);
+        if(result.role==="student")setActiveStudent(result.user);
+        setView("dashboard");
+      }catch(e){showNotif("❌ "+e.message,"error");}
+    }else{
+      showNotif("❌ Invalid credentials","error");
+    }
   };
 
   /* Send DM from incharge to student */
-  const sendDMFromIncharge=(student,msg)=>{
+  const sendDMFromIncharge=async(student,msg)=>{
     if(!msg.trim())return;
     const cu=currentUser;
-    const newDm={
-      id:Date.now(),fromId:cu.id||cu.email,fromName:cu.name,fromAvatar:cu.avatar,
-      toId:student.id,toName:student.name,msg,ts:new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"}),read:false
-    };
+    const dmObj={fromId:cu.id||cu.email,fromName:cu.name,fromAvatar:cu.avatar,toId:student.id,toName:student.name,msg};
+    const newDm={id:Date.now(),...dmObj,ts:new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"}),read:false};
     setDms(p=>[...p,newDm]);
     showNotif(`✉ Message sent to ${student.name}`,"success");
     setDmModal({open:false,student:null,msg:""});
+    if(isConfigured){try{await DB.sendDm(dmObj);}catch(e){console.warn("DM error:",e.message);}}
   };
   /* Send DM between students */
-  const sendStudentDM=(toStudent,msg)=>{
+  const sendStudentDM=async(toStudent,msg)=>{
     if(!msg.trim()||!activeStudent)return;
-    const newDm={
-      id:Date.now(),fromId:activeStudent.id,fromName:activeStudent.name,fromAvatar:activeStudent.avatar,
-      toId:toStudent.id,toName:toStudent.name,msg,ts:new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"}),read:false
-    };
+    const dmObj={fromId:activeStudent.id,fromName:activeStudent.name,fromAvatar:activeStudent.avatar,toId:toStudent.id,toName:toStudent.name,msg};
+    const newDm={id:Date.now(),...dmObj,ts:new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"}),read:false};
     setDms(p=>[...p,newDm]);
+    if(isConfigured){try{await DB.sendDm(dmObj);}catch(e){console.warn("DM error:",e.message);}}
   };
 
   const scopedStudents=useMemo(()=>{
@@ -533,6 +606,14 @@ export default function OrbitApp(){
   },[dms,activeStudent]);
 
   const myUnread=myDms.filter(d=>d.toId===activeStudent?.id&&!d.read).length;
+
+  if(dbLoading)return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0A0A0E",flexDirection:"column",gap:20}}>
+      <div style={{width:48,height:48,borderRadius:"50%",background:"linear-gradient(135deg,#FF6B2B,#FF3D00)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,animation:"glowPulse 1.2s infinite"}}>✦</div>
+      <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#F2F2F8"}}>Loading ORBIT…</div>
+      <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"rgba(255,107,43,0.6)",letterSpacing:1}}>CONNECTING TO DATABASE</div>
+    </div>
+  );
 
   if(showKeyModal)return(
     <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0A0A0E",fontFamily:"'Space Grotesk',sans-serif"}}>
@@ -648,7 +729,7 @@ export default function OrbitApp(){
               {view==="profile"    &&<StudentProfile student={activeStudent} verifyCode={verifyCode} showNotif={showNotif}/>}
               {view==="leaderboard"&&<Leaderboard students={students.filter(s=>s.status==="ACTIVE")} activeStudent={activeStudent}/>}
               {view==="offers"     &&<OffersManager offers={MOCK_OFFERS.filter(o=>o.student===activeStudent.name)} showNotif={showNotif} isStudent/>}
-              {view==="community"  &&<Community messages={communityMsgs} setMessages={setCommunityMsgs} chatInput={chatInput} setChatInput={setChatInput} activeUser={activeStudent} allStudents={students.filter(s=>s.status==="ACTIVE"&&s.id!==activeStudent.id)} dms={myDms} sendDM={sendStudentDM} role="student" setDmsRead={(dmId)=>setDms(p=>p.map(d=>d.id===dmId?{...d,read:true}:d))}/>}
+              {view==="community"  &&<Community messages={communityMsgs} setMessages={setCommunityMsgs} chatInput={chatInput} setChatInput={setChatInput} activeUser={activeStudent} allStudents={students.filter(s=>s.status==="ACTIVE"&&s.id!==activeStudent.id)} dms={myDms} sendDM={sendStudentDM} role="student" setDmsRead={async(dmId)=>{setDms(p=>p.map(d=>d.id===dmId?{...d,read:true}:d));if(isConfigured)await DB.markDmRead(dmId);}}/>}
               {view==="platforms"  &&<PlatformsHub student={activeStudent}/>}
               {view==="resume"      &&<ResumeBuilder student={activeStudent} showNotif={showNotif}/>}
               {view==="mocktest"    &&<MockTest student={activeStudent} showNotif={showNotif}/>}
